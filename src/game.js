@@ -4,6 +4,7 @@ import { EffectComposer } from '../vendor/EffectComposer.js';
 import { RenderPass } from '../vendor/RenderPass.js';
 import { UnrealBloomPass } from '../vendor/UnrealBloomPass.js';
 import { OutputPass } from '../vendor/OutputPass.js';
+import { ShaderPass } from '../vendor/ShaderPass.js';
 import { initAudio, sfx, startMusic, stopMusic, setIntense, isMuted, setMuted, suspendAudio } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
@@ -28,10 +29,24 @@ scene.fog = new THREE.Fog(FOG, 70, 260);
 const camera = new THREE.PerspectiveCamera(58, 1, 0.1, 700);
 const CAM_DIST = 11;
 
-const composer = new EffectComposer(renderer);
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(4, 4, { type: THREE.HalfFloatType, samples: 4 }));
 composer.addPass(new RenderPass(scene, camera));
 const bloom = new UnrealBloomPass(new THREE.Vector2(256, 256), 0.6, 0.5, 0.9);
 composer.addPass(bloom);
+// 镜头效果：暗角 + 受击时的色散
+const lensPass = new ShaderPass({
+  uniforms: { tDiffuse: { value: null }, uAb: { value: 0.012 } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: `
+    uniform sampler2D tDiffuse; uniform float uAb; varying vec2 vUv;
+    void main(){
+      vec2 c = vUv - 0.5; float d = dot(c, c); vec2 o = c * d * uAb;
+      vec3 col = vec3(texture2D(tDiffuse, vUv + o).r, texture2D(tDiffuse, vUv).g, texture2D(tDiffuse, vUv - o).b);
+      col *= 1.0 - d * 0.85;
+      gl_FragColor = vec4(col, 1.0);
+    }`,
+});
+composer.addPass(lensPass);
 composer.addPass(new OutputPass());
 
 const field = { x: 8, y: 4, yc: 5.2 };
@@ -47,43 +62,88 @@ function resize() {
   camera.updateProjectionMatrix();
   const halfH = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * CAM_DIST;
   field.x = clamp(halfH * aspect * 1.5, 4.5, 12);
-  field.y = clamp(halfH * 0.72, 3, 5.5);
-  field.yc = field.y + 1.4;
+  field.y = clamp(halfH * 0.5, 2.4, 4.6);
+  field.yc = field.y + 2.3;
   unitsPerPx = (2 * halfH) / viewH;
   const dpr = window.devicePixelRatio || 1;
-  const pr = quality === 2 ? Math.min(dpr, 2) : quality === 1 ? Math.min(dpr, 1.25) : 1;
+  const pr = quality === 2 ? Math.min(dpr, 2) : quality === 1 ? Math.min(dpr, 1.5) : Math.min(dpr, 1.25);
+  const samples = quality === 2 ? 4 : 0;
+  if (composer.renderTarget1.samples !== samples) {
+    composer.renderTarget1.samples = composer.renderTarget2.samples = samples;
+    composer.renderTarget1.dispose(); composer.renderTarget2.dispose();
+  }
   renderer.setPixelRatio(pr);
   renderer.setSize(viewW, viewH, false);
   composer.setPixelRatio(pr);
   composer.setSize(viewW, viewH);
+  starMat.uniforms.uPR.value = pr;
   if (particleMat) particleMat.uniforms.uScale.value = (viewH * pr) / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)));
 }
 
 // ---------------------------------------------------------------- 灯光与天空
-scene.add(new THREE.HemisphereLight(0x9fc4ff, 0x5a2a88, 1.5));
+scene.add(new THREE.HemisphereLight(0x9fc4ff, 0x5a2a88, 0.9));
 const sunLight = new THREE.DirectionalLight(0xffffff, 2.0);
 sunLight.position.set(4, 10, 8);
 scene.add(sunLight);
 
-const sky = new THREE.Mesh(
-  new THREE.SphereGeometry(600, 24, 16),
-  new THREE.ShaderMaterial({
-    side: THREE.BackSide, depthWrite: false, fog: false,
-    uniforms: { uFog: { value: FOG } },
-    vertexShader: 'varying vec3 vD; void main(){ vD = normalize(position); gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+// 星云天空：开场时一次性画到贴图上，之后每帧零开销；同一张图也用来给金属做反光
+function bakeSky(w, h, env) {
+  const rt = new THREE.WebGLRenderTarget(w, h, { type: THREE.HalfFloatType, depthBuffer: false });
+  rt.texture.wrapS = THREE.RepeatWrapping;
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { uFog: { value: FOG }, uEnv: { value: env ? 1 : 0 } },
+    vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
     fragmentShader: `
-      uniform vec3 uFog; varying vec3 vD;
+      uniform vec3 uFog; uniform float uEnv; varying vec2 vUv;
+      float hash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+      float noise(vec3 x){ vec3 i = floor(x), f = fract(x); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                   mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z); }
+      float fbm(vec3 p){ float a = 0.5, s = 0.0; for (int i = 0; i < 6; i++) { s += a * noise(p); p = p * 2.03 + 7.1; a *= 0.5; } return s; }
       void main(){
-        vec3 d = normalize(vD);
+        float phi = vUv.x * 6.2831853, th = (1.0 - vUv.y) * 3.14159265;
+        vec3 d = vec3(-cos(phi) * sin(th), cos(th), sin(phi) * sin(th));
         float h = clamp(d.y, 0.0, 1.0);
         vec3 col = mix(uFog, vec3(0.012, 0.004, 0.05), pow(h, 0.45));
+        float n1 = fbm(d * 2.2 + vec3(3.1, 0.0, 1.7));
+        float n2 = fbm(d * 3.7 + vec3(-5.0, 2.0, 9.0) + n1 * 1.5);
+        float n3 = fbm(d * 6.0 + 20.0);
+        float mask = smoothstep(0.05, 0.45, h);
+        col += vec3(0.55, 0.12, 0.8) * pow(smoothstep(0.4, 0.8, n2), 1.5) * 0.75 * mask;
+        col += vec3(0.06, 0.35, 0.9) * pow(smoothstep(0.42, 0.85, n1), 1.5) * 0.65 * mask;
+        col += vec3(1.0, 0.3, 0.5) * pow(smoothstep(0.5, 0.9, n3), 2.0) * 0.4 * mask;
         float s = max(dot(d, normalize(vec3(0.0, 0.07, -1.0))), 0.0);
         col += vec3(1.0, 0.35, 0.55) * pow(s, 24.0) * 0.3;
-        col += vec3(0.25, 0.3, 0.9) * pow(max(dot(d, normalize(vec3(-0.5, 0.4, -1.0))), 0.0), 10.0) * 0.25;
-        if (d.y < 0.0) col = uFog;
+        if (d.y < 0.0) col = mix(uFog, vec3(0.02, 0.25, 0.5), clamp(-d.y * 1.5, 0.0, 1.0));
+        if (uEnv > 0.5) {
+          col *= 1.6;
+          col += vec3(1.0, 0.95, 0.9) * pow(max(dot(d, normalize(vec3(0.2, 1.0, 0.3))), 0.0), 6.0) * 2.2;
+          col += vec3(0.2, 0.9, 1.6) * pow(max(dot(d, normalize(vec3(-1.0, 0.25, 0.2))), 0.0), 5.0) * 2.0;
+          col += vec3(1.6, 0.3, 0.9) * pow(max(dot(d, normalize(vec3(1.0, 0.25, 0.2))), 0.0), 5.0) * 2.0;
+          col += vec3(1.4, 0.8, 0.3) * pow(s, 8.0) * 1.5;
+        }
         gl_FragColor = vec4(col, 1.0);
       }`,
-  }),
+  });
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+  quad.frustumCulled = false;
+  const sc = new THREE.Scene(); sc.add(quad);
+  renderer.setRenderTarget(rt); renderer.render(sc, new THREE.Camera()); renderer.setRenderTarget(null);
+  mat.dispose(); quad.geometry.dispose();
+  return rt;
+}
+const skyTex = bakeSky(2048, 1024, false).texture;
+skyTex.generateMipmaps = false;
+{
+  const envRT = bakeSky(512, 256, true);
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromEquirectangular(envRT.texture).texture;
+  scene.environmentIntensity = 0.7;
+  pmrem.dispose(); envRT.dispose();
+}
+const sky = new THREE.Mesh(
+  new THREE.SphereGeometry(600, 48, 24),
+  new THREE.MeshBasicMaterial({ map: skyTex, side: THREE.BackSide, depthWrite: false, fog: false }),
 );
 sky.renderOrder = -10;
 scene.add(sky);
@@ -122,58 +182,122 @@ planet.add(pring);
 planet.position.set(-190, 150, -480);
 scene.add(planet);
 
-// 星星
-const STAR_N = 900;
+// 星星：圆润、大小不一、会闪烁
+const STAR_N = 1500;
 const starGeo = new THREE.BufferGeometry();
-const starPos = new Float32Array(STAR_N * 3);
-for (let i = 0; i < STAR_N; i++) {
-  starPos[i * 3] = rand(-260, 260); starPos[i * 3 + 1] = rand(8, 200); starPos[i * 3 + 2] = rand(-420, -120);
+{
+  const pos = new Float32Array(STAR_N * 3), dat = new Float32Array(STAR_N * 2), col = new Float32Array(STAR_N * 3);
+  for (let i = 0; i < STAR_N; i++) {
+    const u = Math.random() * 0.98 + 0.02, a = Math.random() * Math.PI * 2, r = Math.sqrt(1 - u * u) * 560;
+    pos[i * 3] = Math.cos(a) * r; pos[i * 3 + 1] = u * 560; pos[i * 3 + 2] = Math.sin(a) * r;
+    dat[i * 2] = Math.random() < 0.08 ? rand(3.5, 5.5) : rand(1.2, 2.8); dat[i * 2 + 1] = Math.random() * 6.28;
+    const c = pick([[1, 1, 1], [0.7, 0.85, 1], [1, 0.8, 0.9], [1, 0.95, 0.7]]);
+    col[i * 3] = c[0]; col[i * 3 + 1] = c[1]; col[i * 3 + 2] = c[2];
+  }
+  starGeo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  starGeo.setAttribute('aDat', new THREE.BufferAttribute(dat, 2));
+  starGeo.setAttribute('aCol', new THREE.BufferAttribute(col, 3));
 }
-starGeo.setAttribute('position', new THREE.BufferAttribute(starPos, 3));
-const stars = new THREE.Points(starGeo, new THREE.PointsMaterial({ color: 0xcfe4ff, size: 1.6 * Math.min(window.devicePixelRatio || 1, 2), sizeAttenuation: false, fog: false, transparent: true, opacity: 0.9, depthWrite: false }));
-stars.frustumCulled = false;
+const starMat = new THREE.ShaderMaterial({
+  uniforms: { uT: { value: 0 }, uPR: { value: 1 } },
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, fog: false,
+  vertexShader: `
+    attribute vec2 aDat; attribute vec3 aCol; uniform float uT; uniform float uPR; varying vec3 vC;
+    void main(){ float tw = 0.65 + 0.35 * sin(uT * 2.5 + aDat.y); vC = aCol * tw;
+      gl_PointSize = aDat.x * uPR; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
+  fragmentShader: `
+    varying vec3 vC;
+    void main(){ float d = length(gl_PointCoord - 0.5); float a = smoothstep(0.5, 0.0, d); gl_FragColor = vec4(vC * 1.3, a * a); }`,
+});
+const stars = new THREE.Points(starGeo, starMat);
+stars.frustumCulled = false; stars.renderOrder = -8;
 scene.add(stars);
 
 // 霓虹网格地面
 const WORLD_SPEED = 62;
 const floorMat = new THREE.ShaderMaterial({
   uniforms: { uOff: { value: 0 }, uFog: { value: FOG }, uPulse: { value: 0 } },
-  vertexShader: 'varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position, 1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }',
+  vertexShader: `
+    uniform float uOff; varying vec3 vW; varying float vH; varying float vM;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float noise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1,0)), f.x), mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), f.x), f.y); }
+    void main(){
+      vec4 w = modelMatrix * vec4(position, 1.0);
+      vec2 p = vec2(w.x, w.z - uOff);
+      float m = smoothstep(58.0, 150.0, abs(w.x));
+      float h = noise(p * 0.02) * 0.65 + noise(p * 0.055) * 0.35;
+      h = pow(h, 1.5) * 80.0 * m;
+      w.y += h; vH = h; vM = m; vW = w.xyz;
+      gl_Position = projectionMatrix * viewMatrix * w;
+    }`,
   fragmentShader: `
-    uniform float uOff; uniform float uPulse; uniform vec3 uFog; varying vec3 vW;
+    uniform float uOff; uniform float uPulse; uniform vec3 uFog; varying vec3 vW; varying float vH; varying float vM;
     void main(){
       vec2 p = vec2(vW.x, vW.z - uOff) / 5.0;
       vec2 g = abs(fract(p - 0.5) - 0.5) / fwidth(p);
       float line = 1.0 - min(min(g.x, g.y), 1.0);
+      vec2 p2 = p * 5.0;
+      vec2 g2 = abs(fract(p2 - 0.5) - 0.5) / fwidth(p2);
       float d = length(vW.xz - cameraPosition.xz);
-      float fade = exp(-d * 0.011);
+      float line2 = (1.0 - min(min(g2.x, g2.y), 1.0)) * 0.16 * exp(-d * 0.045);
+      float node = smoothstep(0.07, 0.0, length(abs(fract(p - 0.5) - 0.5))) * exp(-d * 0.02);
+      float fade = exp(-d * mix(0.011, 0.0065, vM));
       vec3 lc = mix(vec3(0.1, 0.95, 1.7), vec3(1.7, 0.2, 1.3), smoothstep(15.0, 110.0, d));
+      lc = mix(lc, vec3(1.9, 1.0, 0.3), smoothstep(10.0, 50.0, vH));
       float wave = 0.5 + 0.5 * sin((vW.z - uOff) * 0.08);
-      vec3 col = vec3(0.02, 0.0, 0.07) + lc * line * (0.75 + uPulse) + lc * 0.05 * wave;
+      float sr = exp(-abs(vW.x) * 0.045) * smoothstep(25.0, 160.0, d) * (0.55 + 0.45 * sin((vW.z - uOff) * 0.5 + sin(vW.x * 0.7) * 2.0)) * (1.0 - vM);
+      vec3 col = vec3(0.02, 0.0, 0.07) + vec3(0.07, 0.0, 0.12) * smoothstep(0.0, 45.0, vH);
+      col += lc * line * (0.75 + uPulse) + lc * line2 + lc * node * 1.4 + lc * 0.05 * wave + vec3(1.0, 0.3, 0.5) * sr * 0.3;
       gl_FragColor = vec4(mix(uFog, col, fade), 1.0);
     }`,
 });
-const floor = new THREE.Mesh(new THREE.PlaneGeometry(900, 700), floorMat);
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(900, 700, 180, 140), floorMat);
 floor.rotation.x = -Math.PI / 2; floor.position.z = -300;
+floor.frustumCulled = false;
 scene.add(floor);
 
 // 两侧飞驰而过的光塔和头顶的光环门
-const PYL_N = 36;
+const PYL_N = 40;
 const pylGeo = new THREE.BoxGeometry(1, 1, 1);
-const pylons = new THREE.InstancedMesh(pylGeo, new THREE.MeshStandardMaterial({ color: 0x1a1140, roughness: 0.5, metalness: 0.4 }), PYL_N);
-const pylTops = new THREE.InstancedMesh(pylGeo, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.3, 1.6, 2.2) }), PYL_N);
-pylons.frustumCulled = pylTops.frustumCulled = false;
+const pylons = new THREE.InstancedMesh(pylGeo, new THREE.ShaderMaterial({
+  uniforms: { uFog: { value: FOG } },
+  vertexShader: `
+    varying vec3 vL; varying vec3 vN; varying vec3 vCol; varying vec3 vS; varying float vDepth;
+    void main(){
+      vec4 w = modelMatrix * instanceMatrix * vec4(position, 1.0);
+      vL = position; vN = normal; vCol = instanceColor;
+      vS = vec3(length(instanceMatrix[0].xyz), length(instanceMatrix[1].xyz), length(instanceMatrix[2].xyz));
+      vec4 mv = viewMatrix * w; vDepth = -mv.z; gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: `
+    uniform vec3 uFog; varying vec3 vL; varying vec3 vN; varying vec3 vCol; varying vec3 vS; varying float vDepth;
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    void main(){
+      float side = step(abs(vN.y), 0.5);
+      float u = (abs(vN.x) > 0.5 ? vL.z : vL.x) * vS.x;
+      vec2 cell = vec2(u * 1.7 + 0.5, vL.y * vS.y * 0.85);
+      vec2 id = floor(cell), f = fract(cell);
+      float lit = step(0.42, hash(id + floor(vS.y * 7.0)));
+      float win = step(0.18, f.x) * step(f.x, 0.82) * step(0.3, f.y) * step(f.y, 0.78);
+      float edge = smoothstep(0.44, 0.5, abs((abs(vN.x) > 0.5 ? vL.z : vL.x)));
+      vec3 col = vec3(0.035, 0.02, 0.09) + vCol * win * lit * 0.5 * side + vCol * edge * side * 0.7;
+      col += vCol * smoothstep(0.455, 0.47, vL.y) * 1.2;
+      gl_FragColor = vec4(mix(col, uFog, smoothstep(70.0, 260.0, vDepth)), 1.0);
+    }`,
+}), PYL_N);
+pylons.frustumCulled = false;
 const pylData = [];
 for (let i = 0; i < PYL_N; i++) {
   const side = i % 2 ? 1 : -1;
-  pylData.push({ x: side * rand(24, 70), z: -i * 9 + 10, h: rand(6, 26), w: rand(1.5, 3.5) });
-  pylTops.setColorAt(i, new THREE.Color().setHSL(pick([0.52, 0.85, 0.12]), 1, 0.5).multiplyScalar(2.2));
+  pylData.push({ x: side * rand(24, 56), z: -i * 8 + 10, h: rand(8, 34), w: rand(2, 4.5) });
+  pylons.setColorAt(i, new THREE.Color().setHSL(pick([0.52, 0.85, 0.12, 0.58]), 1, 0.5).multiplyScalar(1.9));
 }
-scene.add(pylons, pylTops);
+scene.add(pylons);
 const gates = [];
 for (let i = 0; i < 4; i++) {
   const col = i % 2 ? new THREE.Color(2.0, 0.3, 1.4) : new THREE.Color(0.3, 1.5, 2.2);
-  const g = new THREE.Mesh(new THREE.TorusGeometry(24, 0.35, 6, 40, Math.PI), new THREE.MeshBasicMaterial({ color: col }));
+  const g = new THREE.Mesh(new THREE.TorusGeometry(24, 0.3, 12, 96, Math.PI), new THREE.MeshBasicMaterial({ color: col }));
   g.position.z = -i * 80 - 40;
   gates.push(g); scene.add(g);
 }
@@ -194,7 +318,7 @@ const particleMat = new THREE.ShaderMaterial({
   vertexShader: `
     attribute vec4 aColor; attribute float aSize; uniform float uScale; varying vec4 vC;
     void main(){ vC = aColor; vec4 mv = modelViewMatrix * vec4(position, 1.0);
-      gl_PointSize = min(aSize * uScale / max(-mv.z, 0.5), 420.0); gl_Position = projectionMatrix * mv; }`,
+      gl_PointSize = min(aSize * uScale / max(-mv.z, 0.5), 260.0); gl_Position = projectionMatrix * mv; }`,
   fragmentShader: `
     varying vec4 vC;
     void main(){ float d = length(gl_PointCoord - 0.5); float a = smoothstep(0.5, 0.0, d); a = a * a * vC.a;
@@ -262,7 +386,61 @@ const C = {
 let trauma = 0;
 function shake(a) { trauma = Math.min(1, trauma + a); }
 
+// 爆炸火球
+const fireballs = [];
+for (let i = 0; i < 10; i++) {
+  const m = new THREE.Mesh(new THREE.SphereGeometry(1, 24, 16), new THREE.ShaderMaterial({
+    uniforms: { uCol: { value: new THREE.Color() }, uA: { value: 1 } },
+    transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+    vertexShader: 'varying vec3 vN; varying vec3 vV; void main(){ vec4 mv = modelViewMatrix * vec4(position, 1.0); vN = normalMatrix * normal; vV = -mv.xyz; gl_Position = projectionMatrix * mv; }',
+    fragmentShader: 'uniform vec3 uCol; uniform float uA; varying vec3 vN; varying vec3 vV; void main(){ float f = pow(max(dot(normalize(vN), normalize(vV)), 0.0), 2.2); gl_FragColor = vec4(mix(uCol, vec3(1.5, 1.4, 1.2), f * uA), f * uA); }',
+  }));
+  m.visible = false; m.renderOrder = 4; scene.add(m);
+  fireballs.push({ m, t: 0, life: 0, s: 1 });
+}
+let fbIdx = 0;
+function fireball(x, y, z, color, s, life = 0.38) {
+  const f = fireballs[fbIdx]; fbIdx = (fbIdx + 1) % fireballs.length;
+  f.m.position.set(x, y, z); f.m.material.uniforms.uCol.value.copy(color); f.m.visible = true; f.t = 0; f.life = life; f.s = s;
+}
+// 爆炸飞出的金属碎片
+const DEB_N = 110;
+const debMesh = new THREE.InstancedMesh(new THREE.TetrahedronGeometry(0.4), new THREE.MeshStandardMaterial({ color: 0x8a90b0, roughness: 0.3, metalness: 0.9 }), DEB_N);
+debMesh.frustumCulled = false; debMesh.count = 0; scene.add(debMesh);
+const debris = [], debEuler = new THREE.Euler(), debQ = new THREE.Quaternion(), debP = new THREE.Vector3(), debS = new THREE.Vector3(), debM = new THREE.Matrix4();
+function spawnDebris(x, y, z, n, power) {
+  for (let i = 0; i < n; i++) {
+    if (debris.length >= DEB_N) debris.shift();
+    const u = Math.random() * 2 - 1, th = Math.random() * 6.28, s = Math.sqrt(1 - u * u), sp = rand(8, 22) * power;
+    debris.push({ x, y, z, vx: s * Math.cos(th) * sp, vy: Math.abs(u) * sp + 4, vz: s * Math.sin(th) * sp + 14, rx: rand(0, 6), ry: rand(0, 6), rs: rand(4, 14), life: rand(0.9, 1.7), s: rand(0.5, 1.3) * Math.sqrt(power) });
+  }
+}
+function updateFx(dt) {
+  for (const f of fireballs) {
+    if (!f.m.visible) continue;
+    f.t += dt; const k = f.t / f.life;
+    if (k >= 1) { f.m.visible = false; continue; }
+    f.m.scale.setScalar(f.s * (0.35 + 0.65 * (1 - (1 - k) * (1 - k))));
+    f.m.material.uniforms.uA.value = Math.pow(1 - k, 1.4);
+  }
+  let n = 0;
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const d = debris[i];
+    d.life -= dt;
+    if (d.life <= 0) { debris.splice(i, 1); continue; }
+    d.vy -= 30 * dt; d.x += d.vx * dt; d.y += d.vy * dt; d.z += d.vz * dt;
+    if (d.y < 0.3) { d.y = 0.3; d.vy *= -0.45; d.vx *= 0.7; }
+    d.rx += d.rs * dt; d.ry += d.rs * 0.7 * dt;
+    debEuler.set(d.rx, d.ry, 0); debQ.setFromEuler(debEuler);
+    debP.set(d.x, d.y, d.z); debS.setScalar(d.s * Math.min(1, d.life * 3));
+    debM.compose(debP, debQ, debS); debMesh.setMatrixAt(n++, debM);
+  }
+  debMesh.count = n; debMesh.instanceMatrix.needsUpdate = true;
+}
+
 function explode(x, y, z, color, scale = 1, quiet = false) {
+  fireball(x, y, z, color, 2.6 * scale);
+  spawnDebris(x, y, z, Math.round(4 + scale * 3), 0.7 + scale * 0.3);
   const n = Math.round(26 * Math.min(scale, 3)) + 8;
   for (let i = 0; i < n; i++) {
     const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2, s = Math.sqrt(1 - u * u);
@@ -283,14 +461,14 @@ function explode(x, y, z, color, scale = 1, quiet = false) {
 
 // ---------------------------------------------------------------- 模型零件
 const G = {
-  sphere: new THREE.SphereGeometry(1, 18, 12), box: new THREE.BoxGeometry(1, 1, 1), cone: new THREE.ConeGeometry(1, 1, 10),
-  cyl: new THREE.CylinderGeometry(1, 1, 1, 12), torus: new THREE.TorusGeometry(1, 0.1, 8, 28), oct: new THREE.OctahedronGeometry(1),
+  sphere: new THREE.SphereGeometry(1, 32, 20), box: new THREE.BoxGeometry(1, 1, 1), cone: new THREE.ConeGeometry(1, 1, 24),
+  cyl: new THREE.CylinderGeometry(1, 1, 1, 24), torus: new THREE.TorusGeometry(1, 0.1, 12, 64), oct: new THREE.OctahedronGeometry(1),
   ico: new THREE.IcosahedronGeometry(1, 0),
 };
 const glowMat = {};
 for (const k in C) glowMat[k] = new THREE.MeshBasicMaterial({ color: C[k] });
-const darkMat = new THREE.MeshStandardMaterial({ color: 0x23233a, roughness: 0.45, metalness: 0.6 });
-const std = (color, emissive = 0x000000) => new THREE.MeshStandardMaterial({ color, emissive, roughness: 0.38, metalness: 0.35 });
+const darkMat = new THREE.MeshStandardMaterial({ color: 0x2a2a44, roughness: 0.28, metalness: 0.9 });
+const std = (color, emissive = 0x000000) => new THREE.MeshStandardMaterial({ color, emissive, roughness: 0.26, metalness: 0.72 });
 
 function part(parent, geo, mat, sx, sy, sz, x = 0, y = 0, z = 0) {
   const m = new THREE.Mesh(geo, mat);
@@ -302,27 +480,198 @@ function part(parent, geo, mat, sx, sy, sz, x = 0, y = 0, z = 0) {
 const ship = new THREE.Group();
 const shipBody = new THREE.Group();
 ship.add(shipBody);
-{
-  const hull = std(0xe9f2ff), blue = std(0x1f6bff), red = std(0xff3355);
-  const nose = part(shipBody, G.cone, hull, 0.5, 2.4, 0.42, 0, 0, -0.9); nose.rotation.x = -Math.PI / 2;
-  part(shipBody, G.box, hull, 0.9, 0.42, 1.5, 0, 0, 0.55);
-  part(shipBody, G.sphere, glowMat.cyan, 0.3, 0.24, 0.6, 0, 0.28, -0.1);
-  for (const s of [-1, 1]) {
-    const wing = part(shipBody, G.box, blue, 1.7, 0.09, 0.95, s * 1.15, -0.05, 0.75); wing.rotation.y = s * -0.35; wing.rotation.z = s * 0.08;
-    part(shipBody, G.box, red, 0.12, 0.5, 0.8, s * 1.95, 0.15, 1.0);
-    const gun = part(shipBody, G.cyl, darkMat, 0.09, 1.3, 0.09, s * 1.25, -0.1, 0.0); gun.rotation.x = Math.PI / 2;
-    part(shipBody, G.sphere, glowMat.gold, 0.11, 0.11, 0.11, s * 1.25, -0.1, -0.68);
-    const eng = part(shipBody, G.cyl, darkMat, 0.26, 0.7, 0.26, s * 0.42, 0, 1.35); eng.rotation.x = Math.PI / 2;
-    part(shipBody, G.sphere, glowMat.cyan, 0.16, 0.16, 0.1, s * 0.42, 0, 1.72);
-  }
-  const fin = part(shipBody, G.box, red, 0.08, 0.6, 0.8, 0, 0.45, 1.0); fin.rotation.x = 0.35;
+function extrude(pts, depth) {
+  const sh = new THREE.Shape();
+  pts.forEach(([x, y], i) => (i ? sh.lineTo(x, y) : sh.moveTo(x, y)));
+  const g = new THREE.ExtrudeGeometry(sh, { depth, bevelEnabled: true, bevelThickness: 0.025, bevelSize: 0.025, bevelSegments: 2 });
+  g.translate(0, 0, -depth / 2);
+  return g;
 }
+const HERO_K = 1.55;
+shipBody.scale.setScalar(HERO_K);
+const yAxis = new THREE.Vector3(0, 1, 0);
+function limb(parent, mat, r, ax, ay, az, bx, by, bz) {
+  const a = new THREE.Vector3(ax, ay, az), b = new THREE.Vector3(bx, by, bz), d = b.clone().sub(a);
+  const m = new THREE.Mesh(new THREE.CapsuleGeometry(r, d.length(), 4, 12), mat);
+  m.position.copy(a).add(b).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(yAxis, d.normalize());
+  parent.add(m);
+  return m;
+}
+const hero = { scarf: [], gunMount: new THREE.Group(), gun: null, pop: 0, recoil: 0 };
+{
+  const soft = (color, rough = 0.6) => new THREE.MeshStandardMaterial({ color, roughness: rough, metalness: 0.05 });
+  const skin = soft(0xffc7a0), hair = soft(0x3a2212, 0.5), suit = std(0x1c5cff), armor = std(0xd5dcf0), red = soft(0xff2b3f, 0.45);
+  suit.metalness = 0.35; suit.roughness = 0.4; armor.roughness = 0.2;
+  // 飞行滑板
+  const boardG = extrude([[-0.4, -1.25], [0.4, -1.25], [0.52, -0.7], [0.52, 0.9], [0.24, 1.7], [-0.24, 1.7], [-0.52, 0.9], [-0.52, -0.7]], 0.1); boardG.rotateX(-Math.PI / 2);
+  part(shipBody, boardG, armor, 1, 1, 1, 0, -1.08, 0.1);
+  part(shipBody, G.box, glowMat.cyan, 0.5, 0.03, 2.2, 0, -1.17, 0.0);
+  for (const s of [-1, 1]) {
+    part(shipBody, G.box, glowMat.pink, 0.04, 0.05, 1.6, s * 0.54, -1.08, 0.0);
+    const th = part(shipBody, G.cyl, darkMat, 0.14, 0.5, 0.14, s * 0.26, -1.08, 1.4); th.rotation.x = Math.PI / 2;
+    part(shipBody, G.torus, glowMat.cyan, 0.15, 0.15, 0.5, s * 0.26, -1.08, 1.66);
+  }
+  // 腿和靴子（冲浪站姿）
+  limb(shipBody, suit, 0.13, -0.16, -0.32, 0.05, -0.2, -0.9, 0.4);
+  limb(shipBody, suit, 0.13, 0.16, -0.32, -0.05, 0.2, -0.9, -0.35);
+  part(shipBody, G.box, armor, 0.26, 0.2, 0.46, -0.2, -0.95, 0.36);
+  part(shipBody, G.box, armor, 0.26, 0.2, 0.46, 0.2, -0.95, -0.4);
+  part(shipBody, G.box, glowMat.cyan, 0.27, 0.04, 0.47, -0.2, -1.0, 0.36);
+  part(shipBody, G.box, glowMat.cyan, 0.27, 0.04, 0.47, 0.2, -1.0, -0.4);
+  // 身体、盔甲、喷气背包
+  part(shipBody, G.sphere, suit, 0.36, 0.44, 0.28, 0, 0.02, 0);
+  part(shipBody, G.sphere, armor, 0.39, 0.26, 0.31, 0, 0.2, 0);
+  const belt = part(shipBody, G.torus, glowMat.gold, 0.31, 0.25, 0.5, 0, -0.26, 0); belt.rotation.x = Math.PI / 2;
+  part(shipBody, G.box, darkMat, 0.42, 0.46, 0.2, 0, 0.14, 0.32);
+  part(shipBody, G.sphere, glowMat.cyan, 0.1, 0.1, 0.05, 0, 0.2, 0.43);
+  for (const s of [-1, 1]) {
+    part(shipBody, G.sphere, armor, 0.17, 0.15, 0.17, s * 0.4, 0.3, 0);
+    const nz = part(shipBody, G.cyl, darkMat, 0.07, 0.2, 0.07, s * 0.13, -0.12, 0.36); nz.rotation.x = 0.3;
+    const sc = new THREE.Group(); sc.position.set(s * 0.08, 0.44, 0.2);
+    part(sc, G.box, red, 0.17, 0.03, 0.75, 0, 0, 0.4);
+    shipBody.add(sc); hero.scarf.push(sc);
+  }
+  const collar = part(shipBody, G.torus, red, 0.24, 0.24, 1.3, 0, 0.45, 0); collar.rotation.x = Math.PI / 2;
+  // 大头、头发、护目镜、脸
+  part(shipBody, G.sphere, skin, 0.42, 0.4, 0.42, 0, 0.86, 0);
+  part(shipBody, G.sphere, hair, 0.45, 0.36, 0.46, 0, 0.98, 0.04);
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2;
+    const sp = part(shipBody, G.cone, hair, 0.14, 0.42, 0.14, Math.cos(a) * 0.22, 1.3, Math.sin(a) * 0.22 + 0.06);
+    sp.rotation.z = -Math.cos(a) * 0.5; sp.rotation.x = Math.sin(a) * 0.5 + 0.25;
+  }
+  const tuft = part(shipBody, G.cone, hair, 0.16, 0.5, 0.16, 0, 1.36, 0.1); tuft.rotation.x = 0.3;
+  const band = part(shipBody, G.torus, darkMat, 0.43, 0.43, 0.9, 0, 0.98, 0); band.rotation.x = Math.PI / 2;
+  for (const s of [-1, 1]) {
+    part(shipBody, G.sphere, glowMat.cyan, 0.13, 0.1, 0.06, s * 0.16, 1.02, -0.4);
+    part(shipBody, G.sphere, skin, 0.09, 0.11, 0.07, s * 0.42, 0.84, 0);
+    part(shipBody, G.sphere, armor, 0.085, 0.1, 0.05, s * 0.15, 0.84, -0.38);
+    part(shipBody, G.sphere, darkMat, 0.045, 0.06, 0.03, s * 0.15, 0.83, -0.42);
+  }
+  const smile = new THREE.Mesh(new THREE.TorusGeometry(0.1, 0.018, 6, 14, Math.PI), darkMat);
+  smile.position.set(0, 0.72, -0.4); smile.rotation.z = Math.PI; shipBody.add(smile);
+  // 双手握枪
+  hero.gunMount.position.set(0.74, 0.2, -0.55);
+  hero.gunMount.rotation.set(0.36, -0.2, 0);
+  shipBody.add(hero.gunMount);
+  limb(shipBody, suit, 0.1, 0.42, 0.28, 0, 0.72, 0.12, -0.42);
+  limb(shipBody, suit, 0.1, -0.42, 0.28, 0, -0.85, 0.05, 0.25);
+  part(shipBody, G.sphere, skin, 0.12, 0.12, 0.12, 0.74, 0.08, -0.5);
+  part(shipBody, G.sphere, skin, 0.12, 0.12, 0.12, -0.9, 0.02, 0.3);
+}
+
+// 激光枪：5 个等级，每一级外形、颜色、火力都不一样
+const rainbow = new THREE.Color(1.6, 0.4, 0.4);
+const rainbowMat = new THREE.MeshBasicMaterial({ color: rainbow });
+const GUNS = [
+  { name: '小激光枪', col: C.cyan, rate: 0.16 },
+  { name: '双管激光枪', col: C.green, rate: 0.15 },
+  { name: '三管散射炮', col: C.gold, rate: 0.14 },
+  { name: '雷电加特林', col: C.purple, rate: 0.105 },
+  { name: '彩虹毁灭炮', col: rainbow, rate: 0.11 },
+];
+const gunCol = () => GUNS[P.level - 1].col;
+function buildGun(lv) {
+  const g = new THREE.Group();
+  const glow = lv === 5 ? rainbowMat : [glowMat.cyan, glowMat.green, glowMat.gold, glowMat.purple][lv - 1];
+  const white = std(0xd5dcf0), accent = std([0x1c5cff, 0x18b860, 0xffb21a, 0x8a3cff, 0xff3c8a][lv - 1]);
+  white.roughness = 0.18;
+  const barrel = (parent, x, y, len, r, z0 = -0.4) => {
+    const b = part(parent, G.cyl, darkMat, r, len, r, x, y, z0 - len / 2); b.rotation.x = Math.PI / 2;
+    part(parent, G.torus, glow, r * 1.5, r * 1.5, r * 5, x, y, z0 - len);
+    part(parent, G.sphere, glow, r * 0.8, r * 0.8, r * 0.5, x, y, z0 - len);
+  };
+  const grip = part(g, G.box, darkMat, 0.11, 0.3, 0.13, 0, -0.2, 0.08); grip.rotation.x = -0.25;
+  g.userData.spin = []; g.userData.muzzle = 1.2;
+  if (lv === 1) {
+    part(g, G.box, white, 0.2, 0.26, 0.75, 0, 0.02, -0.15);
+    part(g, G.box, accent, 0.21, 0.08, 0.5, 0, -0.06, -0.15);
+    part(g, G.sphere, glow, 0.08, 0.08, 0.22, 0, 0.18, -0.1);
+    barrel(g, 0, 0.03, 0.6, 0.06);
+    g.userData.muzzle = 1.05;
+  } else if (lv === 2) {
+    part(g, G.box, white, 0.36, 0.28, 0.9, 0, 0.02, -0.2);
+    part(g, G.box, accent, 0.38, 0.09, 0.6, 0, -0.07, -0.2);
+    for (const s of [-1, 1]) { barrel(g, s * 0.1, 0.03, 0.8, 0.06, -0.55); part(g, G.box, glow, 0.02, 0.05, 0.6, s * 0.185, 0.06, -0.2); }
+    const scope = part(g, G.cyl, darkMat, 0.06, 0.45, 0.06, 0, 0.24, -0.25); scope.rotation.x = Math.PI / 2;
+    part(g, G.sphere, glow, 0.055, 0.055, 0.03, 0, 0.24, -0.48);
+    part(g, G.box, darkMat, 0.16, 0.18, 0.4, 0, 0, 0.42);
+    g.userData.muzzle = 1.4;
+  } else if (lv === 3) {
+    part(g, G.box, white, 0.42, 0.38, 1.0, 0, 0.03, -0.2);
+    part(g, G.box, accent, 0.44, 0.12, 0.8, 0, 0.03, -0.2);
+    barrel(g, 0, 0.16, 1.1, 0.065, -0.6); barrel(g, -0.13, -0.05, 1.1, 0.065, -0.6); barrel(g, 0.13, -0.05, 1.1, 0.065, -0.6);
+    for (const z of [-0.95, -1.25, -1.55]) part(g, G.torus, glow, 0.27, 0.27, 0.5, 0, 0.04, z);
+    for (const s of [-1, 1]) { const f = part(g, G.box, accent, 0.36, 0.04, 0.5, s * 0.34, 0.05, 0.05); f.rotation.y = s * 0.5; f.rotation.z = s * 0.3; }
+    part(g, G.sphere, glow, 0.13, 0.13, 0.26, 0, 0.27, -0.1);
+    part(g, G.box, darkMat, 0.18, 0.2, 0.45, 0, 0, 0.5);
+    g.userData.muzzle = 1.75;
+  } else if (lv === 4) {
+    const drum = part(g, G.cyl, white, 0.3, 0.8, 0.3, 0, 0.05, -0.2); drum.rotation.x = Math.PI / 2;
+    const dr2 = part(g, G.cyl, accent, 0.32, 0.25, 0.32, 0, 0.05, -0.2); dr2.rotation.x = Math.PI / 2;
+    const rot = new THREE.Group(); rot.position.set(0, 0.05, 0); g.add(rot);
+    for (let i = 0; i < 6; i++) { const a = (i / 6) * Math.PI * 2; barrel(rot, Math.cos(a) * 0.17, Math.sin(a) * 0.17, 1.25, 0.05, -0.6); }
+    for (const z of [-0.75, -1.3, -1.8]) { const d = part(rot, G.cyl, darkMat, 0.27, 0.06, 0.27, 0, 0, z); d.rotation.x = Math.PI / 2; }
+    part(rot, G.torus, glow, 0.3, 0.3, 0.6, 0, 0, -1.85);
+    g.userData.spin.push([rot, 'z', 14]);
+    for (const s of [-1, 1]) { part(g, G.sphere, glow, 0.15, 0.15, 0.3, s * 0.36, 0.05, -0.1); part(g, G.box, darkMat, 0.1, 0.06, 0.5, s * 0.34, 0.05, -0.1); }
+    const h = part(g, G.torus, darkMat, 0.14, 0.14, 0.8, 0, 0.38, -0.2); h.rotation.y = Math.PI / 2;
+    part(g, G.box, darkMat, 0.2, 0.22, 0.5, 0, 0, 0.5);
+    g.userData.muzzle = 2.0;
+  } else {
+    part(g, G.box, white, 0.5, 0.46, 1.1, 0, 0.05, -0.15);
+    part(g, G.box, accent, 0.52, 0.14, 0.9, 0, 0.05, -0.15);
+    const main = part(g, G.cyl, white, 0.2, 1.5, 0.2, 0, 0.05, -1.4); main.rotation.x = Math.PI / 2;
+    const core = part(g, G.cyl, glow, 0.11, 1.75, 0.11, 0, 0.05, -1.45); core.rotation.x = Math.PI / 2;
+    [[-1.0, 0.44], [-1.5, 0.38], [-2.0, 0.32]].forEach(([z, r], i) => {
+      const ring = new THREE.Group(); ring.position.set(0, 0.05, z); g.add(ring);
+      part(ring, G.torus, glow, r, r, 0.6);
+      for (let k = 0; k < 3; k++) { const a = (k / 3) * Math.PI * 2; part(ring, G.box, white, 0.08, 0.08, 0.14, Math.cos(a) * r, Math.sin(a) * r, 0); }
+      g.userData.spin.push([ring, 'z', (i % 2 ? -1 : 1) * (3 + i * 1.5)]);
+    });
+    const cr = part(g, G.oct, glow, 0.16, 0.24, 0.16, 0, 0.5, -0.15); g.userData.spin.push([cr, 'y', 4]);
+    for (const s of [-1, 1]) {
+      const w = part(g, G.box, glow, 0.8, 0.025, 0.12, s * 0.62, 0.14, 0.1); w.rotation.y = s * 0.6; w.rotation.z = s * 0.3;
+      const w2 = part(g, G.box, glow, 0.5, 0.025, 0.09, s * 0.5, -0.08, 0.25); w2.rotation.y = s * 0.7; w2.rotation.z = s * -0.2;
+      part(g, G.sphere, glow, 0.1, 0.1, 0.1, s * 0.3, 0.05, 0.42);
+    }
+    part(g, G.box, darkMat, 0.22, 0.24, 0.5, 0, 0, 0.55);
+    g.userData.muzzle = 2.4;
+  }
+  g.scale.setScalar([1.35, 1.45, 1.55, 1.65, 1.8][lv - 1]);
+  return g;
+}
+function setGun(lv, announce) {
+  P.level = lv;
+  if (hero.gun) hero.gunMount.remove(hero.gun);
+  hero.gun = buildGun(lv); hero.gunMount.add(hero.gun);
+  $('gunName').textContent = GUNS[lv - 1].name;
+  $('gunPips').innerHTML = [1, 2, 3, 4, 5].map((i) => `<i class="${i <= lv ? 'on' : ''}"></i>`).join('');
+  $('weapon').dataset.lv = lv;
+  if (!announce) return;
+  hero.pop = 1; sfx.power();
+  banner(GUNS[lv - 1].name, '⚡ 武器升级！', false);
+  const c = GUNS[lv - 1].col;
+  shockwave(P.x, P.y, 0, c, 12, 0.5); shockwave(P.x, P.y, 0, C.white, 7, 0.35);
+  fireball(P.x + 0.7, P.y, -1.5, c, 3, 0.4);
+  for (let i = 0; i < 40; i++) { const a = Math.random() * 6.28, sp = rand(6, 20); spark(P.x + 0.7, P.y, -1, Math.cos(a) * sp, Math.sin(a) * sp, rand(-6, 6), c.r, c.g, c.b, rand(0.4, 0.9), rand(0.4, 0.8), 2); }
+}
+
+// 飞船在地面上投下的光晕
+const shipGlow = new THREE.Mesh(new THREE.CircleGeometry(1, 32), new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, blending: THREE.AdditiveBlending,
+  vertexShader: 'varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }',
+  fragmentShader: 'varying vec2 vUv; void main(){ float a = smoothstep(0.5, 0.0, distance(vUv, vec2(0.5))); gl_FragColor = vec4(vec3(0.1, 0.6, 1.0), a * a * 0.6); }',
+}));
+shipGlow.rotation.x = -Math.PI / 2; shipGlow.renderOrder = 1;
+scene.add(shipGlow);
 const flames = [];
 for (const s of [-1, 1]) {
-  const f = part(shipBody, G.cone, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 1.5, 3), transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }), 0.15, 1.0, 0.15, s * 0.42, 0, 2.2);
+  const f = part(shipBody, G.cone, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.4, 1.5, 3), transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }), 0.12, 0.8, 0.12, s * 0.26, -1.08, 2.1);
   f.rotation.x = Math.PI / 2; flames.push(f);
 }
-const shieldMesh = part(ship, G.sphere, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 0.9, 1.8), transparent: true, opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false }), 2.2, 1.2, 2.3, 0, 0, 0.3);
+const shieldMesh = part(ship, G.sphere, new THREE.MeshBasicMaterial({ color: new THREE.Color(0.2, 0.9, 1.8), transparent: true, opacity: 0.1, blending: THREE.AdditiveBlending, depthWrite: false }), 2.8, 3.2, 3.2, 0, 0.1, -0.4);
 shieldMesh.visible = false;
 scene.add(ship);
 
@@ -338,21 +687,41 @@ scene.add(reticle);
 
 // ---------------------------------------------------------------- 子弹（实例化渲染）
 const PB_MAX = 220, EB_MAX = 200;
-const pbGeo = new THREE.CylinderGeometry(0.1, 0.1, 2.4, 6); pbGeo.rotateX(Math.PI / 2);
-const pbMesh = new THREE.InstancedMesh(pbGeo, new THREE.MeshBasicMaterial({ color: C.cyan, fog: false }), PB_MAX);
-const ebMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.5, 12, 8), new THREE.MeshBasicMaterial({ color: C.pink, fog: false }), EB_MAX);
+const boltMat = (col, core) => {
+  const m = new THREE.ShaderMaterial({
+    uniforms: { uCol: { value: col }, uCore: { value: core } },
+    vertexShader: `
+      varying vec3 vN; varying vec3 vV; varying vec3 vIC;
+      void main(){ vec4 mv = modelViewMatrix * instanceMatrix * vec4(position, 1.0);
+        #ifdef USE_INSTANCING_COLOR
+          vIC = instanceColor;
+        #else
+          vIC = vec3(1.0);
+        #endif
+        vN = normalMatrix * mat3(instanceMatrix) * normal; vV = -mv.xyz; gl_Position = projectionMatrix * mv; }`,
+    fragmentShader: `
+      uniform vec3 uCol; uniform float uCore; varying vec3 vN; varying vec3 vV; varying vec3 vIC;
+      void main(){ float f = abs(dot(normalize(vN), normalize(vV)));
+        gl_FragColor = vec4(mix(uCol * vIC, vec3(uCore), pow(f, 2.5)), 1.0); }`,
+  });
+  m.color = col; // 方便直接改颜色
+  return m;
+};
+const pbGeo = new THREE.CapsuleGeometry(0.11, 2.2, 4, 10); pbGeo.rotateX(Math.PI / 2);
+const pbMesh = new THREE.InstancedMesh(pbGeo, boltMat(new THREE.Color(1, 1, 1), 2.2), PB_MAX);
+pbMesh.setColorAt(0, C.cyan);
+const ebMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.5, 20, 14), boltMat(C.pink.clone(), 2.4), EB_MAX);
 pbMesh.frustumCulled = ebMesh.frustumCulled = false; pbMesh.count = ebMesh.count = 0;
 scene.add(pbMesh, ebMesh);
 const pBullets = [], eBullets = [];
 const m4 = new THREE.Matrix4(), q0 = new THREE.Quaternion(), v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), ONE = new THREE.Vector3(1, 1, 1);
 const FWD = new THREE.Vector3(0, 0, -1);
-const LEVEL_COL = [C.cyan, C.cyan, C.green, C.gold, C.pink];
 
 // ---------------------------------------------------------------- 游戏状态
 let state = 'menu'; // menu | play | pause | over
 let score = 0, best = 0, wave = 0, combo = 0, comboT = 0, time = 0, timeScale = 1, slowT = 0;
 try { best = parseInt(localStorage.getItem('gw_best') || '0', 10) || 0; } catch (e) { /* ignore */ }
-const P = { x: 0, y: 5, tx: 0, ty: 5, lives: 3, shield: false, inv: 0, level: 1, bombs: 2, fireT: 0, alive: true, deadT: 0 };
+const P = { x: 0, y: 5, tx: 0, ty: 5, lives: 3, shield: false, inv: 0, level: 1, bombs: 2, fireT: 0, alive: true, deadT: 0, superT: 0 };
 const enemies = [], pickups = [], spawnQ = [];
 let waveT = 0, waveState = 'idle', boss = null, target = null;
 
@@ -374,7 +743,8 @@ function buildEnemy(type) {
     part(g, G.sphere, mat, 1.6, 0.45, 1.6);
     part(g, G.sphere, glowMat.green, 0.75, 0.6, 0.75, 0, 0.32, 0);
     const t = part(g, G.torus, glowMat.pink, 1.75, 1.75, 1.2); t.rotation.x = Math.PI / 2; spin.push([t, 'z', 3]);
-    part(g, G.sphere, glowMat.gold, 0.22, 0.22, 0.22, 0, -0.1, 1.5);
+    for (let i = 0; i < 8; i++) { const a = (i / 8) * Math.PI * 2; part(g, G.sphere, i % 2 ? glowMat.gold : glowMat.cyan, 0.13, 0.13, 0.13, Math.cos(a) * 1.35, -0.12, Math.sin(a) * 1.35); }
+    part(g, G.sphere, darkMat, 1.0, 0.3, 1.0, 0, -0.25, 0);
     part(g, G.cone, darkMat, 0.5, 0.5, 0.5, 0, -0.55, 0).rotation.x = Math.PI;
   } else if (type === 'bot') {
     mat = std(0xff8a1f);
@@ -437,7 +807,7 @@ function buildEnemy(type) {
 function spawnEnemy(type, opt = {}) {
   const T = TYPES[type];
   const { g, mat } = buildEnemy(type);
-  const hpMul = type === 'boss' ? 1 + (wave / 5 - 1) * 0.6 : 1 + wave * 0.15;
+  const hpMul = type === 'boss' ? 1 + (wave / 5 - 1) * 0.6 : 1 + wave * 0.2;
   const e = {
     type, g, mat, r: T.r, hp: Math.ceil(T.hp * hpMul), maxHp: Math.ceil(T.hp * hpMul), score: T.score, col: T.col,
     x: opt.x ?? rand(-1, 1) * field.x, y: opt.y ?? field.yc + rand(-1, 1) * field.y * 0.85, z: opt.z ?? -150,
@@ -610,9 +980,8 @@ const PICK = {
 };
 function dropPickup(x, y, z, kind) {
   if (!kind) {
-    const pool = ['P', 'P', 'P', 'S', 'B'];
+    const pool = ['P', 'S', 'B'];
     if (P.lives < 4) pool.push('H', 'H');
-    if (P.level >= 5) pool.push('B', 'S');
     kind = pick(pool);
   }
   const d = PICK[kind];
@@ -637,12 +1006,12 @@ function updatePickups(dt) {
 function collect(p) {
   const d = PICK[p.kind];
   if (p.kind === 'P') {
-    if (P.level < 5) { P.level++; sfx.power(); } else { addScore(500, P.x, P.y, 0, true); sfx.pickup(); }
-    pbMesh.material.color.copy(LEVEL_COL[P.level - 1]);
+    if (P.level < 5) setGun(P.level + 1, true);
+    else { P.superT = 8; addScore(500, P.x, P.y, 0, true); sfx.power(); banner('超级火力', '⚡ 8 秒钟火力全开！', false); }
   } else if (p.kind === 'S') { P.shield = true; sfx.shield(); }
   else if (p.kind === 'B') { P.bombs = Math.min(5, P.bombs + 1); sfx.pickup(); }
   else { P.lives = Math.min(5, P.lives + 1); sfx.pickup(); }
-  popText(P.x, P.y + 1.5, 0, p.kind === 'P' && P.level >= 5 ? '火力全开！' : d.text, 'gold');
+  if (p.kind !== 'P') popText(P.x, P.y + 2, 0, d.text, 'gold');
   shockwave(P.x, P.y, 0, d.col, 5, 0.35);
   for (let i = 0; i < 16; i++) { const a = Math.random() * 6.28; spark(P.x, P.y, 0, Math.cos(a) * 10, Math.sin(a) * 10, 0, d.col.r, d.col.g, d.col.b, 0.6, 0.4, 2); }
   updateHud();
@@ -660,23 +1029,28 @@ function findTarget() {
   return bestE;
 }
 
-const MUZZLES = [[0], [-0.6, 0.6], [-1.25, 0, 1.25], [-1.25, -0.45, 0.45, 1.25], [-1.9, -1.25, 0, 1.25, 1.9]];
+const hsl = new THREE.Color();
 function fire() {
   target = findTarget();
-  const offs = MUZZLES[P.level - 1];
-  for (const o of offs) {
+  const n = P.level, sup = P.superT > 0;
+  const ml = hero.gun.userData.muzzle * hero.gun.scale.x;
+  const mx = P.x + (0.74 + ml * 0.19) * HERO_K, my = P.y + (0.22 + ml * 0.35) * HERO_K, mz = -(0.55 + ml * 0.92) * HERO_K;
+  for (let i = 0; i < n; i++) {
     if (pBullets.length >= PB_MAX) break;
-    const b = { x: P.x + o, y: P.y - 0.1, z: -1.2, vx: 0, vy: 0, vz: -1, q: new THREE.Quaternion() };
+    const o = i - (n - 1) / 2;
+    const b = { x: mx + o * 0.1, y: my, z: mz, vx: 0, vy: 0, vz: -1, q: new THREE.Quaternion(), c: new THREE.Color(), s: sup ? 1.6 : 1 };
+    if (n === 5) b.c.setHSL((time * 0.9 + i * 0.2) % 1, 1, 0.55).multiplyScalar(1.7); else b.c.copy(gunCol());
     if (target) {
       const lead = Math.abs(target.z) / 170;
-      v0.set(target.x + (target.x - (target.px ?? target.x)) / Math.max(lastDt, 0.001) * lead + o * 0.35 - b.x, target.y + o * 0 - b.y, target.z - b.z).normalize();
-    } else v0.set(o * 0.025, 0, -1).normalize();
+      v0.set(target.x + (target.x - (target.px ?? target.x)) / Math.max(lastDt, 0.001) * lead + o * 0.7 - b.x, target.y - b.y, target.z - b.z).normalize();
+    } else v0.set(o * 0.05, 0, -1).normalize();
     b.vx = v0.x * 170; b.vy = v0.y * 170; b.vz = v0.z * 170;
     b.q.setFromUnitVectors(FWD, v0);
     pBullets.push(b);
   }
-  const c = LEVEL_COL[P.level - 1];
-  spark(P.x, P.y, -1.6, 0, 0, -8, c.r * 0.6, c.g * 0.6, c.b * 0.6, 0.9, 0.05, 0);
+  const c = gunCol();
+  spark(mx, my, mz - 0.3, 0, 0, -8, c.r * 0.7, c.g * 0.7, c.b * 0.7, 1.0 + n * 0.25, 0.06, 0);
+  hero.recoil = 1;
   if (state === 'play') sfx.shoot();
 }
 
@@ -692,12 +1066,22 @@ function updatePlayer(dt) {
   P.x += (P.tx - P.x) * k; P.y += (P.ty - P.y) * k;
   const vx = (P.x - ox) / Math.max(dt, 0.001), vy = (P.y - oy) / Math.max(dt, 0.001);
   ship.position.set(P.x, P.y, 0);
-  shipBody.rotation.z += (clamp(-vx * 0.05, -0.8, 0.8) - shipBody.rotation.z) * Math.min(1, dt * 10);
+  shipBody.rotation.z += (clamp(-vx * 0.035, -0.55, 0.55) - shipBody.rotation.z) * Math.min(1, dt * 10);
   shipBody.rotation.x += (clamp(vy * 0.03, -0.4, 0.4) - shipBody.rotation.x) * Math.min(1, dt * 10);
   shipBody.rotation.y = shipBody.rotation.z * -0.3;
   shipBody.position.y = Math.sin(time * 3) * 0.08;
-  for (const f of flames) f.scale.y = 0.8 + Math.random() * 0.5;
-  for (const s of [-0.42, 0.42]) spark(P.x + s, P.y, 2.2, rand(-0.5, 0.5), rand(-0.5, 0.5), 22, 0.12, 0.45, 1.0, 0.4, 0.2, 0);
+  for (const f of flames) f.scale.y = 0.6 + Math.random() * 0.4;
+  hero.scarf.forEach((sc, i) => { sc.rotation.x = -0.25 + Math.sin(time * 9 + i * 1.3) * 0.2; sc.rotation.y = Math.sin(time * 6 + i * 2) * 0.25 + shipBody.rotation.z * 0.8; });
+  rainbow.setHSL((time * 0.5) % 1, 1, 0.5).multiplyScalar(1.8);
+  hero.pop = Math.max(0, hero.pop - dt * 2.2); hero.recoil = Math.max(0, hero.recoil - dt * 12);
+  hero.gunMount.scale.setScalar(1 + Math.sin(hero.pop * Math.PI) * 0.9);
+  hero.gunMount.position.z = -0.55 + hero.recoil * 0.07;
+  hero.gunMount.rotation.z = hero.pop * hero.pop * Math.PI * 2;
+  hero.gunMount.rotation.x = 0.36 + hero.recoil * 0.05;
+  if (hero.gun) for (const [m, ax, sp] of hero.gun.userData.spin) m.rotation[ax] += sp * dt;
+  P.superT = Math.max(0, P.superT - dt);
+  shipGlow.position.set(P.x, 0.08, 0.4); shipGlow.scale.setScalar(2.5 + P.y * 0.35); shipGlow.visible = true;
+  for (const s of [-0.34, 0.34]) spark(P.x + s * 1.2, P.y - 1.08 * HERO_K, 1.8 * HERO_K, rand(-0.5, 0.5), rand(-0.5, 0.5), 22, 0.12, 0.45, 1.0, 0.4, 0.22, 0);
 
   P.inv = Math.max(0, P.inv - dt);
   ship.visible = P.inv <= 0 || Math.floor(P.inv * 14) % 2 === 0;
@@ -705,7 +1089,7 @@ function updatePlayer(dt) {
   if (P.shield) { shieldMesh.material.opacity = 0.09 + 0.04 * Math.sin(time * 8); shieldMesh.rotation.y += dt * 2; }
 
   P.fireT -= dt;
-  if (P.fireT <= 0) { P.fireT = 0.15; fire(); }
+  if (P.fireT <= 0) { P.fireT = GUNS[P.level - 1].rate * (P.superT > 0 ? 0.55 : 1); fire(); }
 }
 
 function hurtPlayer() {
@@ -715,14 +1099,13 @@ function hurtPlayer() {
     shockwave(P.x, P.y, 0, C.cyan, 9, 0.4); popText(P.x, P.y + 1.5, 0, '护盾挡住了！');
     return;
   }
-  P.lives--; P.inv = 2.2; combo = 0; if (P.level > 1) P.level--;
-  pbMesh.material.color.copy(LEVEL_COL[P.level - 1]);
+  P.lives--; P.inv = 2.2; combo = 0; P.superT = 0;
   flash('red'); shake(0.8); sfx.hurt();
   if (navigator.vibrate) navigator.vibrate(120);
   explode(P.x, P.y, 0, C.orange, 0.8, true);
   eBullets.length = 0;
   if (P.lives <= 0) {
-    P.alive = false; P.deadT = 1.4; ship.visible = false; shieldMesh.visible = false; reticle.visible = false;
+    P.alive = false; P.deadT = 1.4; ship.visible = false; shipGlow.visible = false; shieldMesh.visible = false; reticle.visible = false;
     explode(P.x, P.y, 0, C.cyan, 2.5); explode(P.x, P.y, 0, C.orange, 2, true);
     timeScale = 0.3; slowT = 0.8; stopMusic(); sfx.over();
   }
@@ -755,7 +1138,7 @@ function updateBullets(dt) {
         if (e.dying > 0) continue;
         if (b.z < e.z + e.r && b.z > e.z - e.r - step && Math.hypot(b.x - e.x, b.y - e.y) < e.r + 0.45) {
           dead = true;
-          const c = LEVEL_COL[P.level - 1];
+          const c = b.c;
           for (let k = 0; k < 4; k++) spark(b.x, b.y, e.z + e.r * 0.7, rand(-9, 9), rand(-9, 9), rand(4, 16), c.r, c.g, c.b, 0.5, 0.25, 2);
           if (state === 'play') sfx.hit();
           damageEnemy(e, 1);
@@ -775,8 +1158,8 @@ function updateBullets(dt) {
     if (dead && i < eBullets.length) { eBullets[i] = eBullets[eBullets.length - 1]; eBullets.pop(); }
   }
   let n = 0;
-  for (const b of pBullets) { v0.set(b.x, b.y, b.z); m4.compose(v0, b.q, ONE); pbMesh.setMatrixAt(n++, m4); }
-  pbMesh.count = n; pbMesh.instanceMatrix.needsUpdate = true;
+  for (const b of pBullets) { v0.set(b.x, b.y, b.z); v1.set(b.s, b.s, 1); m4.compose(v0, b.q, v1); pbMesh.setMatrixAt(n, m4); pbMesh.setColorAt(n++, b.c); }
+  pbMesh.count = n; pbMesh.instanceMatrix.needsUpdate = true; pbMesh.instanceColor.needsUpdate = true;
   n = 0; q0.identity();
   for (const b of eBullets) { v0.set(b.x, b.y, b.z); v1.setScalar(1 + 0.2 * Math.sin(time * 14 + b.ph)); m4.compose(v0, q0, v1); ebMesh.setMatrixAt(n++, m4); }
   ebMesh.count = n; ebMesh.instanceMatrix.needsUpdate = true;
@@ -817,7 +1200,7 @@ function updateWaves(dt) {
   }
   if (waveState === 'spawning' && spawnQ.length === 0 && enemies.length === 0) {
     waveState = 'clear'; waveT = 1.6;
-    if (wave > 0) { addScore(wave * 200, P.x, P.y + 2, 0, true); if (wave % 5) dropPickup(rand(-1, 1) * field.x * 0.6, field.yc, -70); }
+    if (wave > 0) { addScore(wave * 200, P.x, P.y + 2, 0, true); if (wave % 5) dropPickup(rand(-1, 1) * field.x * 0.6, field.yc, -70, wave % 2 === 0 ? 'P' : pick(['S', 'B', P.lives < 4 ? 'H' : 'S'])); }
   } else if (waveState === 'clear') {
     waveT -= dt;
     if (waveT <= 0) startWave(wave + 1);
@@ -883,8 +1266,8 @@ function startGame() {
   initAudio();
   clearWorld();
   score = 0; wave = 0; combo = 0; timeScale = 1; slowT = 0;
-  Object.assign(P, { x: 0, y: field.yc, tx: 0, ty: field.yc, lives: 4, shield: false, inv: 1.5, level: 1, bombs: 2, fireT: 0.3, alive: true });
-  pbMesh.material.color.copy(LEVEL_COL[0]);
+  Object.assign(P, { x: 0, y: field.yc, tx: 0, ty: field.yc, lives: 4, shield: false, inv: 1.5, level: 1, bombs: 2, fireT: 0.3, alive: true, superT: 0 });
+  setGun(1, false);
   ship.visible = true;
   waveState = 'clear'; waveT = 0.8;
   state = 'play';
@@ -952,28 +1335,29 @@ let last = performance.now(), lastDt = 0.016, floorPulse = 0, fpsT = 0, fpsN = 0
 const camPos = new THREE.Vector3(0, 6, CAM_DIST), camLook = new THREE.Vector3(0, 5, -30);
 
 function updateScenery(dt) {
-  floorMat.uniforms.uOff.value = (floorMat.uniforms.uOff.value + WORLD_SPEED * dt) % 1000;
+  floorMat.uniforms.uOff.value = (floorMat.uniforms.uOff.value + WORLD_SPEED * dt) % 100000;
   floorPulse = Math.max(0, floorPulse - dt * 1.5); floorMat.uniforms.uPulse.value = floorPulse * 2;
   sun.material.uniforms.uT.value = time;
   planet.rotation.y += dt * 0.02;
-  for (let i = 0; i < STAR_N; i++) { let z = starPos[i * 3 + 2] + dt * 12; if (z > -120) z -= 300; starPos[i * 3 + 2] = z; }
-  starGeo.attributes.position.needsUpdate = true;
+  starMat.uniforms.uT.value = time;
+  if (Math.random() < dt * 45) spark(camPos.x + rand(-34, 34), rand(0.5, 20), -170, 0, 0, 170, 0.5, 0.75, 1.3, 0.32, 0.9, 0, 0);
   for (let i = 0; i < PYL_N; i++) {
     const p = pylData[i]; p.z += WORLD_SPEED * dt;
-    if (p.z > 20) { p.z -= PYL_N * 9; p.h = rand(6, 26); }
+    if (p.z > 20) { p.z -= PYL_N * 8; p.h = rand(8, 34); }
     v0.set(p.x, p.h / 2, p.z); v1.set(p.w, p.h, p.w); q0.identity(); m4.compose(v0, q0, v1); pylons.setMatrixAt(i, m4);
-    v0.set(p.x, p.h + 0.3, p.z); v1.set(p.w * 1.15, 0.5, p.w * 1.15); m4.compose(v0, q0, v1); pylTops.setMatrixAt(i, m4);
   }
-  pylons.instanceMatrix.needsUpdate = pylTops.instanceMatrix.needsUpdate = true;
+  pylons.instanceMatrix.needsUpdate = true;
   for (const g of gates) { g.position.z += WORLD_SPEED * dt; if (g.position.z > 20) g.position.z -= 320; }
 }
 
 function updateCamera(rdt) {
   const fx = P.x, fy = P.y - field.yc;
-  v0.set(fx * 0.74, field.yc + fy * 0.7 + 2.6, CAM_DIST);
+  const land = viewW > viewH;
+  if (state === 'menu') v0.set(P.x + (land ? 2.5 : 2), P.y + 0.8, land ? -10.5 : -13.5); else v0.set(fx * 0.74 + 1.0, field.yc + fy * 0.9 + 3.8, CAM_DIST);
   camPos.lerp(v0, Math.min(1, rdt * 7));
-  camLook.lerp(v1.set(fx * 0.82, field.yc + fy * 0.8 - 0.6, -30), Math.min(1, rdt * 7));
+  camLook.lerp(state === 'menu' ? v1.set(P.x - (land ? 2.2 : 0), P.y + (land ? -0.2 : 6.2), 0) : v1.set(fx * 0.82 + 0.4, field.yc + fy * 0.92 - 3.0, -30), Math.min(1, rdt * 7));
   trauma = Math.max(0, trauma - rdt * 1.6);
+  lensPass.uniforms.uAb.value = 0.012 + trauma * trauma * 0.14;
   const s = trauma * trauma;
   camera.position.set(camPos.x + rand(-1, 1) * s * 0.9, camPos.y + rand(-1, 1) * s * 0.9, camPos.z + rand(-1, 1) * s * 0.4);
   camera.lookAt(camLook);
@@ -1002,7 +1386,7 @@ function frame(now) {
 
   updateScenery(dt);
   if (state === 'menu') {
-    P.tx = Math.sin(time * 0.7) * field.x * 0.5; P.ty = field.yc + Math.sin(time * 1.1) * 1.2;
+    P.tx = Math.sin(time * 0.7) * 0.8; P.ty = field.yc + Math.sin(time * 1.1) * 0.4;
     updatePlayer(dt); updateBullets(dt);
   } else {
     for (const e of enemies) e.px = e.x;
@@ -1011,7 +1395,7 @@ function frame(now) {
     if (!P.alive && state === 'play') { P.deadT -= rdt; if (P.deadT <= 0) gameOver(); }
   }
   lastDt = dt;
-  updateParticles(dt); updateCamera(rdt); updateRings(dt); updateReticle(dt);
+  updateParticles(dt); updateFx(dt); updateCamera(rdt); updateRings(dt); updateReticle(dt);
 
   if (quality > 0) composer.render(); else renderer.render(scene, camera);
 
@@ -1028,6 +1412,7 @@ function frame(now) {
 resize();
 P.y = P.ty = field.yc;
 updateHud();
+setGun(1, false);
 requestAnimationFrame(frame);
 
-if (params.has('debug')) window.__game = { P, enemies, eBullets, get state() { return state; }, get wave() { return wave; }, get score() { return score; }, get quality() { return quality; }, startWave, useBomb, hurtPlayer, dropPickup, spawnEnemy };
+if (params.has('debug')) window.__game = { P, enemies, eBullets, get state() { return state; }, get wave() { return wave; }, get score() { return score; }, get quality() { return quality; }, startWave, useBomb, hurtPlayer, dropPickup, spawnEnemy, setGun };
