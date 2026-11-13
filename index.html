@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#05010f">
+<title>银河小战士 · 3D 星际射击</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<div id="flash"></div>
+<div id="fx"></div>
+
+<div id="hud" class="hidden">
+  <div id="topbar">
+    <div id="scorebox">
+      <div id="score">0</div>
+      <div id="best">最高 0</div>
+    </div>
+    <div id="wavebox">第 <span id="wave">1</span> 波</div>
+    <div id="rightbox">
+      <div id="hearts"></div>
+      <button id="muteBtn" class="iconbtn" aria-label="声音">🔊</button>
+      <button id="pauseBtn" class="iconbtn" aria-label="暂停">⏸</button>
+    </div>
+  </div>
+  <div id="bossBar"><div id="bossName">机械魔王</div><div id="bossTrack"><div id="bossFill"></div></div></div>
+  <div id="combo"></div>
+  <button id="bombBtn" aria-label="大招">💥<span id="bombCount">2</span></button>
+</div>
+
+<div id="banner"><div id="bannerMain"></div><div id="bannerSub"></div></div>
+
+<div id="menu" class="overlay">
+  <h1>银河小战士</h1>
+  <p class="sub">3D 星际射击大冒险</p>
+  <button id="startBtn" class="bigbtn">开始战斗</button>
+  <ul class="tips">
+    <li>👆 手指在屏幕上拖动，驾驶飞船</li>
+    <li>🔫 飞船会自动瞄准、自动开火</li>
+    <li>💥 危险的时候点右下角放大招</li>
+    <li>🎁 吃掉发光宝石：火力、护盾、炸弹、爱心</li>
+  </ul>
+</div>
+
+<div id="pauseOv" class="overlay hidden">
+  <h2>暂停中</h2>
+  <button id="resumeBtn" class="bigbtn">继续战斗</button>
+</div>
+
+<div id="over" class="overlay hidden">
+  <h2 id="overTitle">飞船坠毁了！</h2>
+  <p id="newBest" class="hidden">🏆 新纪录！</p>
+  <p class="stat">得分 <b id="overScore">0</b></p>
+  <p class="stat small">坚持到第 <b id="overWave">1</b> 波 · 最高分 <b id="overBest">0</b></p>
+  <button id="againBtn" class="bigbtn">再来一次</button>
+</div>
+
+<div id="err" class="overlay hidden"><p>这个浏览器不支持 3D 画面，请换一个新一点的浏览器试试。</p></div>
+
+<script type="module" src="src/game.js"></script>
+</body>
+</html>
