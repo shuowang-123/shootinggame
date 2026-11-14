@@ -4,27 +4,68 @@ let ac = null, master = null, sfxGain = null, musicGain = null, noiseBuf = null;
 let muted = false;
 try { muted = localStorage.getItem('gw_mute') === '1'; } catch (e) { /* ignore */ }
 
+let silentEl = null, analyser = null;
+const VOL = 1.8;
+
+// 一小段无声的 WAV。循环播放它，iPhone / iPad 就会把网页当成“正在播放媒体”，
+// 这样即使侧边的静音开关打开，WebAudio 的声音也能出来。
+function silentWavUrl() {
+  const n = 8000, b = new Uint8Array(44 + n), dv = new DataView(b.buffer);
+  const str = (o, t) => { for (let i = 0; i < t.length; i++) b[o + i] = t.charCodeAt(i); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + n, true); str(8, 'WAVE'); str(12, 'fmt ');
+  dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, 8000, true); dv.setUint32(28, 8000, true); dv.setUint16(32, 1, true); dv.setUint16(34, 8, true);
+  str(36, 'data'); dv.setUint32(40, n, true); b.fill(128, 44);
+  return URL.createObjectURL(new Blob([b], { type: 'audio/wav' }));
+}
+
+// 必须在用户手指点击 / 触摸的事件里调用，浏览器才允许出声。可以重复调用。
 export function initAudio() {
   if (!AC) return;
-  if (ac) { if (ac.state !== 'running') ac.resume(); return; }
-  ac = new AC();
-  master = ac.createGain(); master.gain.value = muted ? 0 : 1; master.connect(ac.destination);
-  sfxGain = ac.createGain(); sfxGain.gain.value = 0.9; sfxGain.connect(master);
-  musicGain = ac.createGain(); musicGain.gain.value = 0.32; musicGain.connect(master);
-  noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
-  const d = noiseBuf.getChannelData(0);
-  for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) { /* ignore */ }
+  try {
+    if (!silentEl) {
+      silentEl = new Audio(silentWavUrl());
+      silentEl.loop = true; silentEl.preload = 'auto';
+      silentEl.setAttribute('playsinline', ''); silentEl.setAttribute('webkit-playsinline', '');
+    }
+    if (silentEl.paused) { const pr = silentEl.play(); if (pr && pr.catch) pr.catch(() => {}); }
+  } catch (e) { /* ignore */ }
+  if (!ac) {
+    ac = new AC();
+    master = ac.createGain(); master.gain.value = muted ? 0 : VOL;
+    // 压限器：把整体音量提上去，又不会在爆炸很多的时候破音
+    const comp = ac.createDynamicsCompressor();
+    comp.threshold.value = -14; comp.knee.value = 12; comp.ratio.value = 6; comp.attack.value = 0.003; comp.release.value = 0.2;
+    master.connect(comp); comp.connect(ac.destination);
+    analyser = ac.createAnalyser(); analyser.fftSize = 256; master.connect(analyser);
+    sfxGain = ac.createGain(); sfxGain.gain.value = 0.9; sfxGain.connect(master);
+    musicGain = ac.createGain(); musicGain.gain.value = 0.32; musicGain.connect(master);
+    noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
+    const d = noiseBuf.getChannelData(0);
+    for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+  }
+  if (ac.state !== 'running') { const pr = ac.resume(); if (pr && pr.catch) pr.catch(() => {}); }
+  // 在手势里播一个极短的空白声音，老版本 iOS 靠这个解锁
+  try { const s = ac.createBufferSource(); s.buffer = ac.createBuffer(1, 1, 22050); s.connect(ac.destination); s.start(0); } catch (e) { /* ignore */ }
+}
+
+export function audioDebug() {
+  if (!ac) return { state: 'none', peak: 0 };
+  const d = new Uint8Array(analyser.fftSize); analyser.getByteTimeDomainData(d);
+  let peak = 0; for (const v of d) peak = Math.max(peak, Math.abs(v - 128));
+  return { state: ac.state, peak, muted };
 }
 
 export function isMuted() { return muted; }
 export function setMuted(m) {
   muted = m;
   try { localStorage.setItem('gw_mute', m ? '1' : '0'); } catch (e) { /* ignore */ }
-  if (master) master.gain.value = m ? 0 : 1;
+  if (master) master.gain.value = m ? 0 : VOL;
 }
 export function suspendAudio(on) {
   if (!ac) return;
-  if (on) ac.suspend(); else ac.resume();
+  if (on) { ac.suspend(); if (silentEl) silentEl.pause(); } else initAudio();
 }
 
 function tone(type, f0, f1, dur, vol, delay = 0, dest = sfxGain) {
