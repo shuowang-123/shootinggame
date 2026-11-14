@@ -5,7 +5,7 @@ import { RenderPass } from '../vendor/RenderPass.js';
 import { UnrealBloomPass } from '../vendor/UnrealBloomPass.js';
 import { OutputPass } from '../vendor/OutputPass.js';
 import { ShaderPass } from '../vendor/ShaderPass.js';
-import { initAudio, sfx, startMusic, stopMusic, setIntense, isMuted, setMuted, suspendAudio } from './audio.js';
+import { initAudio, sfx, startMusic, stopMusic, setIntense, isMuted, setMuted, suspendAudio, audioDebug } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -1327,6 +1327,11 @@ const showMute = () => { muteBtn.textContent = isMuted() ? '🔇' : '🔊'; };
 tap('muteBtn', () => { setMuted(!isMuted()); showMute(); });
 showMute();
 document.addEventListener('visibilitychange', () => { if (document.hidden) setPaused(true); });
+// 每次手指触摸都确认一下声音是开着的：手机浏览器只允许在触摸事件里启动声音，
+// 而且切到后台、来电话之后声音会被系统停掉
+for (const ev of ['pointerdown', 'pointerup', 'touchend', 'click', 'keydown']) {
+  window.addEventListener(ev, () => { if (state !== 'pause') initAudio(); }, { capture: true, passive: true });
+}
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(resize, 200));
 
@@ -1415,4 +1420,4 @@ updateHud();
 setGun(1, false);
 requestAnimationFrame(frame);
 
-if (params.has('debug')) window.__game = { P, enemies, eBullets, get state() { return state; }, get wave() { return wave; }, get score() { return score; }, get quality() { return quality; }, startWave, useBomb, hurtPlayer, dropPickup, spawnEnemy, setGun };
+if (params.has('debug')) window.__game = { P, enemies, eBullets, get state() { return state; }, get wave() { return wave; }, get score() { return score; }, get quality() { return quality; }, startWave, useBomb, hurtPlayer, dropPickup, spawnEnemy, setGun, audioDebug };
